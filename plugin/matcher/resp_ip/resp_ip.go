@@ -46,19 +46,40 @@ func matchRespAddr(qCtx *query_context.Context, m netlist.Matcher) (bool, error)
 	if r == nil {
 		return false, nil
 	}
+
+	matchIP := func(ip net.IP) bool {
+		addr, ok := netip.AddrFromSlice(ip)
+		return ok && m.Match(addr)
+	}
 	for _, rr := range r.Answer {
-		var ip net.IP
 		switch rr := rr.(type) {
 		case *dns.A:
-			ip = rr.A
+			if matchIP(rr.A) {
+				return true, nil
+			}
 		case *dns.AAAA:
-			ip = rr.AAAA
+			if matchIP(rr.AAAA) {
+				return true, nil
+			}
+		case *dns.HTTPS:
+			for _, kv := range rr.Value {
+				switch kv := kv.(type) {
+				case *dns.SVCBIPv4Hint:
+					for _, ip := range kv.Hint {
+						if matchIP(ip) {
+							return true, nil
+						}
+					}
+				case *dns.SVCBIPv6Hint:
+					for _, ip := range kv.Hint {
+						if matchIP(ip) {
+							return true, nil
+						}
+					}
+				}
+			}
 		default:
 			continue
-		}
-		addr, ok := netip.AddrFromSlice(ip)
-		if ok && m.Match(addr) {
-			return true, nil
 		}
 	}
 	return false, nil
