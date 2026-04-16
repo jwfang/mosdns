@@ -20,11 +20,16 @@
 package ech
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
+	"encoding/binary"
+	"fmt"
 	"github.com/IrineSistiana/mosdns/v5/pkg/query_context"
 	"github.com/IrineSistiana/mosdns/v5/plugin/executable/sequence"
 	"github.com/miekg/dns"
+	"io"
+	"unsafe"
 )
 
 const PluginType = "ech"
@@ -37,8 +42,48 @@ type ECH struct {
 	ech []byte
 }
 
+func validateECH(bs []byte) error {
+	r := bytes.NewReader(bs)
+
+	var rl uint16
+	err := binary.Read(r, binary.BigEndian, &rl)
+	if err != nil {
+		return err
+	}
+
+	eh := struct {
+		Version uint16
+		Length  uint16
+	}{0, 0}
+
+	i := uint16(2)
+	for i < rl {
+		err = binary.Read(r, binary.BigEndian, &eh)
+		if err != nil {
+			return err
+		}
+
+		if eh.Version != 0xfe0d {
+			return fmt.Errorf("unsupported ECH version: %#x", eh.Version)
+		}
+
+		_, err = r.Seek(int64(eh.Length), io.SeekCurrent)
+		if err != nil {
+			return err
+		}
+
+		i += uint16(unsafe.Sizeof(eh)) + eh.Length
+	}
+
+	return nil
+}
+
 func QuickSetup(_ sequence.BQ, ech string) (any, error) {
 	b, e := base64.StdEncoding.DecodeString(ech)
+	if e != nil {
+		return nil, e
+	}
+	e = validateECH(b)
 	if e != nil {
 		return nil, e
 	}
