@@ -22,14 +22,18 @@ package ech
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/binary"
 	"fmt"
 	"github.com/IrineSistiana/mosdns/v5/pkg/query_context"
 	"github.com/IrineSistiana/mosdns/v5/plugin/executable/forward"
 	"github.com/IrineSistiana/mosdns/v5/plugin/executable/sequence"
 	"github.com/miekg/dns"
+	"go.uber.org/zap"
 	"io"
 	"strings"
+	"sync/atomic"
+	"time"
 	"unsafe"
 )
 
@@ -40,10 +44,14 @@ func init() {
 }
 
 type ECH struct {
+	l *zap.Logger
+
+	fwTag string
+
 	fw    *fastforward.Forward
 	qname string
 
-	ech []byte
+	ech atomic.Pointer[[]byte]
 }
 
 func validateECH(bs []byte) error {
@@ -82,37 +90,37 @@ func validateECH(bs []byte) error {
 	return nil
 }
 
-func resolveECH(fw *fastforward.Forward, qn string) ([]byte, error) {
+func resolveECH(fw *fastforward.Forward, qn string) ([]byte, uint32, error) {
 	m := dns.Msg{}
 	m.SetQuestion(qn, dns.TypeHTTPS)
 
 	qc := query_context.NewContext(&m)
 	err := fw.Exec(context.Background(), qc)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 
 	r := qc.R()
 	if r == nil {
-		return nil, fmt.Errorf("resolve ECH failed: nil R()")
+		return nil, 0, fmt.Errorf("resolve ECH failed: nil R()")
 	}
 
 	for _, rr := range r.Answer {
-		if h, ok := rr.(*dns.HTTPS); ok {
-			for _, kv := range h.Value {
+		if ht, ok := rr.(*dns.HTTPS); ok {
+			for _, kv := range ht.Value {
 				if ec, ok := kv.(*dns.SVCBECHConfig); ok {
 					err := validateECH(ec.ECH)
 					if err == nil {
-						return ec.ECH, nil
+						return ec.ECH, ht.Hdr.Ttl, nil
 					} else {
-						return nil, fmt.Errorf("resolve ECH failed: invalid ECHConfigList: %w", err)
+						return nil, 0, fmt.Errorf("resolve ECH failed: invalid ECHConfigList: %w", err)
 					}
 				}
 			}
 		}
 	}
 
-	return nil, fmt.Errorf("resolve ECH failed: no ECHConfigList")
+	return nil, 0, fmt.Errorf("resolve ECH failed: no ECHConfigList")
 }
 
 func QuickSetup(bq sequence.BQ, args string) (any, error) {
@@ -128,13 +136,46 @@ func QuickSetup(bq sequence.BQ, args string) (any, error) {
 	}
 	qn = dns.Fqdn(qn)
 
-	return &ECH{fw: fw, qname: qn}, nil
+	ech := &ECH{l: bq.L(), fwTag: fwt, fw: fw, qname: qn}
+	go ech.backgroundResolve()
+
+	return ech, nil
 }
 
-func (p *ECH) resolveECH(fw *fastforward.Forward, n string) (string, error) {
-	_ = dns.Msg{MsgHdr: dns.MsgHdr{Id: dns.Id(), RecursionDesired: true},
-		Question: []dns.Question{dns.Question{Name: n, Qtype: dns.TypeHTTPS, Qclass: dns.ClassINET}}}
-	return "", nil
+func (p *ECH) backgroundResolve() {
+	const (
+		FailureRetryInterval = 5 * time.Second
+	)
+	var nextResolve time.Duration
+
+	for {
+		select {
+		case s := <-time.After(nextResolve):
+			ech, ttl, err := resolveECH(p.fw, p.qname)
+			if err != nil {
+				nextResolve = FailureRetryInterval
+				p.l.Warn(fmt.Sprintf("ech : resolve ECH failed, %v", err),
+					zap.String("forward_tag", p.fwTag),
+					zap.String("fqdn", p.qname),
+					zap.String("next_resolve", nextResolve.String()))
+				continue
+			}
+
+			p.ech.Store(&ech)
+
+			roundtrip := time.Since(s)
+			effectiveTTL := max(time.Duration(ttl)*time.Second-roundtrip/2, 0)
+			nextResolve = max(effectiveTTL-3*roundtrip/2, 0)
+
+			p.l.Info("ech : update ECHConfigList",
+				zap.String("forward_tag", p.fwTag),
+				zap.String("fqdn", p.qname),
+				zap.String("ech", base64.StdEncoding.EncodeToString(ech)),
+				zap.Uint32("ttl", ttl),
+				zap.String("forward_roundtrip", roundtrip.String()),
+				zap.String("next_resolve", nextResolve.String()))
+		}
+	}
 }
 
 func (p *ECH) Exec(_ context.Context, qCtx *query_context.Context) error {
@@ -142,27 +183,29 @@ func (p *ECH) Exec(_ context.Context, qCtx *query_context.Context) error {
 		return nil
 	}
 
-	ech, err := resolveECH(p.fw, p.qname)
-	if err != nil {
-		return err
-	}
-
 	r := qCtx.R()
 	if r == nil || r.Rcode != dns.RcodeSuccess {
 		return nil
+	}
+
+	ech := p.ech.Load()
+	if ech == nil {
+		p.l.Warn("ech failed: empty ECHConfigList, configuration or network error",
+			zap.String("forward_tag", p.fwTag),
+			zap.String("fqdn", p.qname))
+		return fmt.Errorf("ech failed: empty ECHConfigList, configuration or network error")
 	}
 
 	var ok bool
 	var ht *dns.HTTPS
 	for _, rr := range r.Answer {
 		if ht, ok = rr.(*dns.HTTPS); ok {
-			break
+		 	break
 		}
 	}
 	if ht == nil {
-		ht = &dns.HTTPS{}
-		ht.Hdr = dns.RR_Header{Name: r.Question[0].Name, Rrtype: dns.TypeHTTPS, Class: dns.ClassINET}
-		ht.Target = "."
+		ht = &dns.HTTPS{dns.SVCB{Priority: 1, Target: ".",
+			Hdr: dns.RR_Header{Name: r.Question[0].Name, Rrtype: dns.TypeHTTPS, Class: dns.ClassINET}}}
 		r.Answer = append(r.Answer, ht)
 	}
 
@@ -173,7 +216,7 @@ func (p *ECH) Exec(_ context.Context, qCtx *query_context.Context) error {
 		}
 	}
 	if ec == nil {
-		ht.Value = append(ht.Value, &dns.SVCBECHConfig{ech})
+		ht.Value = append(ht.Value, &dns.SVCBECHConfig{*ech})
 	}
 
 	return nil
