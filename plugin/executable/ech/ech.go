@@ -184,7 +184,12 @@ func (p *ECH) Exec(_ context.Context, qCtx *query_context.Context) error {
 	}
 
 	r := qCtx.R()
-	if r == nil || r.Rcode != dns.RcodeSuccess {
+	if r == nil {
+		r = &dns.Msg{}
+		r.SetReply(qCtx.Q())
+		qCtx.SetResponse(r)
+	}
+	if r.Rcode != dns.RcodeSuccess {
 		return nil
 	}
 
@@ -200,7 +205,7 @@ func (p *ECH) Exec(_ context.Context, qCtx *query_context.Context) error {
 	var ht *dns.HTTPS
 	for _, rr := range r.Answer {
 		if ht, ok = rr.(*dns.HTTPS); ok {
-		 	break
+			break
 		}
 	}
 	if ht == nil {
