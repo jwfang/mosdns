@@ -20,21 +20,19 @@
 package ech
 
 import (
-	"bytes"
 	"context"
 	"encoding/base64"
-	"encoding/binary"
 	"fmt"
 	"github.com/IrineSistiana/mosdns/v5/pkg/query_context"
+	"github.com/IrineSistiana/mosdns/v5/plugin/data_provider/ip_set"
+	"github.com/IrineSistiana/mosdns/v5/plugin/executable/cache"
 	"github.com/IrineSistiana/mosdns/v5/plugin/executable/forward"
 	"github.com/IrineSistiana/mosdns/v5/plugin/executable/sequence"
 	"github.com/miekg/dns"
 	"go.uber.org/zap"
-	"io"
 	"strings"
 	"sync/atomic"
 	"time"
-	"unsafe"
 )
 
 const PluginType = "ech"
@@ -59,80 +57,11 @@ type ECH struct {
 	fw    *fastforward.Forward
 	qname string
 
+	ipset        *ip_set.IPSet
+	cache        *cache.Cache
+	pollInterval time.Duration
+
 	r atomic.Pointer[reply]
-}
-
-func validateECH(bs []byte) error {
-	r := bytes.NewReader(bs)
-
-	var rl uint16
-	err := binary.Read(r, binary.BigEndian, &rl)
-	if err != nil {
-		return err
-	}
-
-	eh := struct {
-		Version uint16
-		Length  uint16
-	}{0, 0}
-
-	i := uint16(2)
-	for i < rl {
-		err = binary.Read(r, binary.BigEndian, &eh)
-		if err != nil {
-			return err
-		}
-
-		if eh.Version != 0xfe0d {
-			return fmt.Errorf("unsupported ECH version: %#x", eh.Version)
-		}
-
-		_, err = r.Seek(int64(eh.Length), io.SeekCurrent)
-		if err != nil {
-			return err
-		}
-
-		i += uint16(unsafe.Sizeof(eh)) + eh.Length
-	}
-
-	return nil
-}
-
-func resolveECH(fw *fastforward.Forward, qn string) (*dns.HTTPS, *dns.SVCBECHConfig, uint32, error) {
-	m := dns.Msg{}
-	m.SetQuestion(qn, dns.TypeHTTPS)
-
-	qc := query_context.NewContext(&m)
-	err := fw.Exec(context.Background(), qc)
-	if err != nil {
-		return nil, nil, 0, err
-	}
-
-	r := qc.R()
-	if r == nil {
-		return nil, nil, 0, fmt.Errorf("resolve ECH failed: nil R()")
-	}
-
-	for _, rr := range r.Answer {
-		if rr.Header().Rrtype != dns.TypeHTTPS {
-			continue
-		}
-		ht := rr.(*dns.HTTPS)
-		for _, kv := range ht.Value {
-			if kv.Key() != dns.SVCB_ECHCONFIG {
-				continue
-			}
-			ec := kv.(*dns.SVCBECHConfig)
-			err := validateECH(ec.ECH)
-			if err == nil {
-				return ht, ec, ht.Hdr.Ttl, nil
-			} else {
-				return nil, nil, 0, fmt.Errorf("resolve ECH failed: invalid ECHConfigList: %w", err)
-			}
-		}
-	}
-
-	return nil, nil, 0, fmt.Errorf("resolve ECH failed: no ECHConfigList")
 }
 
 func QuickSetup(bq sequence.BQ, args string) (any, error) {
@@ -148,7 +77,13 @@ func QuickSetup(bq sequence.BQ, args string) (any, error) {
 	}
 	qn = dns.Fqdn(qn)
 
-	ech := &ECH{l: bq.L(), fwTag: fwt, fw: fw, qname: qn}
+	ct, pi := "test_poll_cache", 500*time.Millisecond
+	c, ok := bq.M().GetPlugin(ct).(*cache.Cache)
+	if !ok {
+		return nil, fmt.Errorf("no cache with tag `%s`", ct)
+	}
+
+	ech := &ECH{l: bq.L(), fwTag: fwt, fw: fw, qname: qn, cache: c, pollInterval: pi}
 	go ech.backgroundResolve()
 
 	return ech, nil
@@ -197,8 +132,9 @@ func (p *ECH) Exec(_ context.Context, qCtx *query_context.Context) error {
 	}
 
 	r := qCtx.R()
+
+	// exec(ed) before forward, direct reply
 	if r == nil {
-		// exec(ed) before forward, direct reply
 		cr := p.r.Load()
 		if cr == nil {
 			p.l.Warn("ech failed: empty ECHConfigList, configuration or network error",
@@ -209,7 +145,7 @@ func (p *ECH) Exec(_ context.Context, qCtx *query_context.Context) error {
 			r = &dns.Msg{}
 			r.SetReply(qCtx.Q())
 			ht := *cr.rr
-			ht.Hdr.Name = r.Question[0].Name
+			ht.Hdr.Name = p.qname
 			ht.Hdr.Ttl = uint32(max(time.Duration(cr.ttl)*time.Second-time.Since(cr.ts), 0))
 			r.Answer = append(r.Answer, &ht)
 
