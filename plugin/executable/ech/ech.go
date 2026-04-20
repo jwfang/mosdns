@@ -23,6 +23,7 @@ import (
 	"context"
 	"encoding/base64"
 	"fmt"
+	"github.com/IrineSistiana/mosdns/v5/pkg/matcher/netlist"
 	"github.com/IrineSistiana/mosdns/v5/pkg/query_context"
 	"github.com/IrineSistiana/mosdns/v5/plugin/data_provider/ip_set"
 	"github.com/IrineSistiana/mosdns/v5/plugin/executable/cache"
@@ -30,6 +31,7 @@ import (
 	"github.com/IrineSistiana/mosdns/v5/plugin/executable/sequence"
 	"github.com/miekg/dns"
 	"go.uber.org/zap"
+	"net/netip"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -49,6 +51,13 @@ type reply struct {
 	ech *dns.SVCBECHConfig
 }
 
+type poll struct {
+	matcher      netlist.Matcher
+	cache        *cache.Cache
+	pollInterval time.Duration
+	maxDelay     time.Duration
+}
+
 type ECH struct {
 	l *zap.Logger
 
@@ -57,9 +66,7 @@ type ECH struct {
 	fw    *fastforward.Forward
 	qname string
 
-	ipset        *ip_set.IPSet
-	cache        *cache.Cache
-	pollInterval time.Duration
+	poll *poll
 
 	r atomic.Pointer[reply]
 }
@@ -77,13 +84,20 @@ func QuickSetup(bq sequence.BQ, args string) (any, error) {
 	}
 	qn = dns.Fqdn(qn)
 
-	ct, pi := "test_poll_cache", 500*time.Millisecond
+	ist, md := "test_poll_ipset", 10*time.Second
+	ct, pi := "test_poll_cache", 200*time.Millisecond
+
+	is, ok := bq.M().GetPlugin(ist).(*ip_set.IPSet)
+	if !ok {
+		return nil, fmt.Errorf("no cache with tag `%s`", ct)
+	}
 	c, ok := bq.M().GetPlugin(ct).(*cache.Cache)
 	if !ok {
 		return nil, fmt.Errorf("no cache with tag `%s`", ct)
 	}
 
-	ech := &ECH{l: bq.L(), fwTag: fwt, fw: fw, qname: qn, cache: c, pollInterval: pi}
+	poll := poll{cache: c, pollInterval: pi, maxDelay: md, matcher: is.GetIPMatcher()}
+	ech := &ECH{l: bq.L(), fwTag: fwt, fw: fw, qname: qn, poll: &poll}
 	go ech.backgroundResolve()
 
 	return ech, nil
@@ -104,7 +118,7 @@ func (p *ECH) backgroundResolve() {
 				nextResolve = FailureRetryInterval
 				p.l.Warn(fmt.Sprintf("ech : resolve ECH failed, %v", err),
 					zap.String("forward_tag", p.fwTag),
-					zap.String("fqdn", p.qname),
+					zap.String("ech_qname", p.qname),
 					zap.String("next_resolve", nextResolve.String()))
 				continue
 			}
@@ -117,7 +131,7 @@ func (p *ECH) backgroundResolve() {
 
 			p.l.Info("ech : update ECHConfigList",
 				zap.String("forward_tag", p.fwTag),
-				zap.String("fqdn", p.qname),
+				zap.String("ech_qname", p.qname),
 				zap.String("ech", base64.StdEncoding.EncodeToString(ech.ECH)),
 				zap.Uint32("ttl", ttl),
 				zap.String("forward_roundtrip", roundtrip.String()),
@@ -126,8 +140,62 @@ func (p *ECH) backgroundResolve() {
 	}
 }
 
+func (p *ECH) pollMatchCache(qname string) bool {
+	tl := time.Now().Add(p.poll.maxDelay)
+
+	for {
+		p.l.Debug("ech poll match cache",
+			zap.String("forward_tag", p.fwTag),
+			zap.String("ech_qname", p.qname),
+			zap.String("qname", qname))
+		ips := p.poll.cache.GetIPByQName(qname)
+		for i, ip := range ips {
+			p.l.Debug("ech match ip ",
+				zap.String("forward_tag", p.fwTag),
+				zap.String("ech_qname", p.qname),
+				zap.Int("i", i),
+				zap.String("ip", ip.String()))
+			if addr, ok := netip.AddrFromSlice(ip); ok {
+				if p.poll.matcher.Match(addr) {
+					return true
+				}
+			}
+		}
+
+		// assume A and AAAA have same ECHConfig
+		if ips != nil {
+			p.l.Debug("ech poll match cache NOT match",
+				zap.String("forward_tag", p.fwTag),
+				zap.String("ech_qname", p.qname),
+				zap.String("qname", qname))
+			return false
+		}
+
+		if time.Now().After(tl) {
+			break
+		}
+		p.l.Debug(fmt.Sprintf("ech poll match next poll in %s", p.poll.pollInterval),
+			zap.String("forward_tag", p.fwTag),
+			zap.String("ech_qname", p.qname),
+			zap.String("qname", qname))
+		time.Sleep(p.poll.pollInterval)
+	}
+
+	return false
+}
+
 func (p *ECH) Exec(_ context.Context, qCtx *query_context.Context) error {
-	if qCtx.QQuestion().Qtype != dns.TypeHTTPS {
+	q := qCtx.QQuestion()
+	if q.Qtype != dns.TypeHTTPS {
+		return nil
+	}
+
+	qname := q.Name
+	if p.poll != nil && !p.pollMatchCache(qCtx.QQuestion().Name) {
+		p.l.Debug("ech poll match cache NOT match",
+			zap.String("forward_tag", p.fwTag),
+			zap.String("ech_qname", p.qname),
+			zap.String("qname", qname))
 		return nil
 	}
 
@@ -139,25 +207,41 @@ func (p *ECH) Exec(_ context.Context, qCtx *query_context.Context) error {
 		if cr == nil {
 			p.l.Warn("ech failed: empty ECHConfigList, configuration or network error",
 				zap.String("forward_tag", p.fwTag),
-				zap.String("fqdn", p.qname))
+				zap.String("ech_qname", p.qname),
+				zap.String("qname", qname))
 			return fmt.Errorf("ech failed: empty ECHConfigList, configuration or network error")
 		} else {
 			r = &dns.Msg{}
 			r.SetReply(qCtx.Q())
 			ht := *cr.rr
-			ht.Hdr.Name = p.qname
+			ht.Hdr.Name = qname
 			ht.Hdr.Ttl = uint32(max(time.Duration(cr.ttl)*time.Second-time.Since(cr.ts), 0))
 			r.Answer = append(r.Answer, &ht)
 
 			qCtx.SetResponse(r)
+
+			p.l.Debug("ech direct reply",
+				zap.String("forward_tag", p.fwTag),
+				zap.String("ech_qname", p.qname),
+				zap.String("qname", qname))
+
 			return nil
 		}
 	}
 
 	if r.Rcode != dns.RcodeSuccess {
+		p.l.Debug("ech upstream failure, skipping",
+			zap.String("forward_tag", p.fwTag),
+			zap.String("ech_qname", p.qname),
+			zap.String("qname", qname),
+			zap.String("rcode", dns.RcodeToString[r.Rcode]))
 		return nil
 	}
 
+	p.l.Debug("ech filtering response",
+		zap.String("forward_tag", p.fwTag),
+		zap.String("ech_qname", p.qname),
+		zap.String("qname", qname))
 	var ok bool
 	var ht *dns.HTTPS
 	for _, rr := range r.Answer {
@@ -175,15 +259,24 @@ func (p *ECH) Exec(_ context.Context, qCtx *query_context.Context) error {
 	var ec *dns.SVCBECHConfig
 	for _, kv := range ht.Value {
 		if ec, ok = kv.(*dns.SVCBECHConfig); ok {
+			p.l.Warn("ech filter response, found ECHConfig",
+				zap.String("forward_tag", p.fwTag),
+				zap.String("ech_qname", p.qname),
+				zap.String("qname", qname))
 			break
 		}
 	}
 	if ec == nil {
+		p.l.Warn("ech filter response, no ECHConfig, adding",
+			zap.String("forward_tag", p.fwTag),
+			zap.String("ech_qname", p.qname),
+			zap.String("qname", qname))
 		ech := p.r.Load().ech
 		if ht == nil {
 			p.l.Warn("ech failed: empty ECHConfigList, configuration or network error",
 				zap.String("forward_tag", p.fwTag),
-				zap.String("fqdn", p.qname))
+				zap.String("ech_qname", p.qname),
+				zap.String("qname", qname))
 			return fmt.Errorf("ech failed: empty ECHConfigList, configuration or network error")
 		} else {
 			ht.Value = append(ht.Value, ech)
