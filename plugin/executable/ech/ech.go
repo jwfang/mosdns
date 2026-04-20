@@ -106,16 +106,20 @@ func resolveECH(fw *fastforward.Forward, qn string) ([]byte, uint32, error) {
 	}
 
 	for _, rr := range r.Answer {
-		if ht, ok := rr.(*dns.HTTPS); ok {
-			for _, kv := range ht.Value {
-				if ec, ok := kv.(*dns.SVCBECHConfig); ok {
-					err := validateECH(ec.ECH)
-					if err == nil {
-						return ec.ECH, ht.Hdr.Ttl, nil
-					} else {
-						return nil, 0, fmt.Errorf("resolve ECH failed: invalid ECHConfigList: %w", err)
-					}
-				}
+		if rr.Header().Rrtype != dns.TypeHTTPS {
+			continue
+		}
+		ht := rr.(*dns.HTTPS)
+		for _, kv := range ht.Value {
+			if kv.Key() != dns.SVCB_ECHCONFIG {
+				continue
+			}
+			ec := kv.(*dns.SVCBECHConfig)
+			err := validateECH(ec.ECH)
+			if err == nil {
+				return ec.ECH, ht.Hdr.Ttl, nil
+			} else {
+				return nil, 0, fmt.Errorf("resolve ECH failed: invalid ECHConfigList: %w", err)
 			}
 		}
 	}
@@ -185,6 +189,7 @@ func (p *ECH) Exec(_ context.Context, qCtx *query_context.Context) error {
 
 	r := qCtx.R()
 	if r == nil {
+		// exec before forward
 		r = &dns.Msg{}
 		r.SetReply(qCtx.Q())
 		qCtx.SetResponse(r)
