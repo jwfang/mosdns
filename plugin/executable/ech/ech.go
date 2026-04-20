@@ -43,6 +43,14 @@ func init() {
 	sequence.MustRegExecQuickSetup(PluginType, QuickSetup)
 }
 
+type reply struct {
+	ttl uint32
+	ts  time.Time
+
+	rr  *dns.HTTPS
+	ech *dns.SVCBECHConfig
+}
+
 type ECH struct {
 	l *zap.Logger
 
@@ -51,7 +59,7 @@ type ECH struct {
 	fw    *fastforward.Forward
 	qname string
 
-	ech atomic.Pointer[[]byte]
+	r atomic.Pointer[reply]
 }
 
 func validateECH(bs []byte) error {
@@ -90,19 +98,19 @@ func validateECH(bs []byte) error {
 	return nil
 }
 
-func resolveECH(fw *fastforward.Forward, qn string) ([]byte, uint32, error) {
+func resolveECH(fw *fastforward.Forward, qn string) (*dns.HTTPS, *dns.SVCBECHConfig, uint32, error) {
 	m := dns.Msg{}
 	m.SetQuestion(qn, dns.TypeHTTPS)
 
 	qc := query_context.NewContext(&m)
 	err := fw.Exec(context.Background(), qc)
 	if err != nil {
-		return nil, 0, err
+		return nil, nil, 0, err
 	}
 
 	r := qc.R()
 	if r == nil {
-		return nil, 0, fmt.Errorf("resolve ECH failed: nil R()")
+		return nil, nil, 0, fmt.Errorf("resolve ECH failed: nil R()")
 	}
 
 	for _, rr := range r.Answer {
@@ -117,14 +125,14 @@ func resolveECH(fw *fastforward.Forward, qn string) ([]byte, uint32, error) {
 			ec := kv.(*dns.SVCBECHConfig)
 			err := validateECH(ec.ECH)
 			if err == nil {
-				return ec.ECH, ht.Hdr.Ttl, nil
+				return ht, ec, ht.Hdr.Ttl, nil
 			} else {
-				return nil, 0, fmt.Errorf("resolve ECH failed: invalid ECHConfigList: %w", err)
+				return nil, nil, 0, fmt.Errorf("resolve ECH failed: invalid ECHConfigList: %w", err)
 			}
 		}
 	}
 
-	return nil, 0, fmt.Errorf("resolve ECH failed: no ECHConfigList")
+	return nil, nil, 0, fmt.Errorf("resolve ECH failed: no ECHConfigList")
 }
 
 func QuickSetup(bq sequence.BQ, args string) (any, error) {
@@ -149,14 +157,14 @@ func QuickSetup(bq sequence.BQ, args string) (any, error) {
 func (p *ECH) backgroundResolve() {
 	const (
 		FailureRetryInterval = 5 * time.Second
-		MinimumRetryInterval = 100 * time.Millisecond
+		MinimumRetryInterval = 200 * time.Millisecond
 	)
 	var nextResolve time.Duration
 
 	for {
 		select {
 		case s := <-time.After(nextResolve):
-			ech, ttl, err := resolveECH(p.fw, p.qname)
+			ht, ech, ttl, err := resolveECH(p.fw, p.qname)
 			if err != nil {
 				nextResolve = FailureRetryInterval
 				p.l.Warn(fmt.Sprintf("ech : resolve ECH failed, %v", err),
@@ -166,7 +174,7 @@ func (p *ECH) backgroundResolve() {
 				continue
 			}
 
-			p.ech.Store(&ech)
+			p.r.Store(&reply{ttl, time.Now(), ht, ech})
 
 			roundtrip := time.Since(s)
 			effectiveTTL := max(time.Duration(ttl)*time.Second-roundtrip/2, 0)
@@ -175,7 +183,7 @@ func (p *ECH) backgroundResolve() {
 			p.l.Info("ech : update ECHConfigList",
 				zap.String("forward_tag", p.fwTag),
 				zap.String("fqdn", p.qname),
-				zap.String("ech", base64.StdEncoding.EncodeToString(ech)),
+				zap.String("ech", base64.StdEncoding.EncodeToString(ech.ECH)),
 				zap.Uint32("ttl", ttl),
 				zap.String("forward_roundtrip", roundtrip.String()),
 				zap.String("next_resolve", nextResolve.String()))
@@ -190,27 +198,35 @@ func (p *ECH) Exec(_ context.Context, qCtx *query_context.Context) error {
 
 	r := qCtx.R()
 	if r == nil {
-		// exec before forward
-		r = &dns.Msg{}
-		r.SetReply(qCtx.Q())
-		qCtx.SetResponse(r)
-	}
-	if r.Rcode != dns.RcodeSuccess {
-		return nil
+		// exec(ed) before forward, direct reply
+		cr := p.r.Load()
+		if cr == nil {
+			p.l.Warn("ech failed: empty ECHConfigList, configuration or network error",
+				zap.String("forward_tag", p.fwTag),
+				zap.String("fqdn", p.qname))
+			return fmt.Errorf("ech failed: empty ECHConfigList, configuration or network error")
+		} else {
+			r = &dns.Msg{}
+			r.SetReply(qCtx.Q())
+			ht := *cr.rr
+			ht.Hdr.Name = r.Question[0].Name
+			ht.Hdr.Ttl = uint32(max(time.Duration(cr.ttl)*time.Second-time.Since(cr.ts), 0))
+			r.Answer = append(r.Answer, &ht)
+
+			qCtx.SetResponse(r)
+			return nil
+		}
 	}
 
-	ech := p.ech.Load()
-	if ech == nil {
-		p.l.Warn("ech failed: empty ECHConfigList, configuration or network error",
-			zap.String("forward_tag", p.fwTag),
-			zap.String("fqdn", p.qname))
-		return fmt.Errorf("ech failed: empty ECHConfigList, configuration or network error")
+	if r.Rcode != dns.RcodeSuccess {
+		return nil
 	}
 
 	var ok bool
 	var ht *dns.HTTPS
 	for _, rr := range r.Answer {
-		if ht, ok = rr.(*dns.HTTPS); ok {
+		if rr.Header().Rrtype == dns.TypeHTTPS {
+			ht = rr.(*dns.HTTPS)
 			break
 		}
 	}
@@ -227,7 +243,15 @@ func (p *ECH) Exec(_ context.Context, qCtx *query_context.Context) error {
 		}
 	}
 	if ec == nil {
-		ht.Value = append(ht.Value, &dns.SVCBECHConfig{*ech})
+		ech := p.r.Load().ech
+		if ht == nil {
+			p.l.Warn("ech failed: empty ECHConfigList, configuration or network error",
+				zap.String("forward_tag", p.fwTag),
+				zap.String("fqdn", p.qname))
+			return fmt.Errorf("ech failed: empty ECHConfigList, configuration or network error")
+		} else {
+			ht.Value = append(ht.Value, ech)
+		}
 	}
 
 	return nil
