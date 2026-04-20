@@ -149,6 +149,7 @@ func QuickSetup(bq sequence.BQ, args string) (any, error) {
 func (p *ECH) backgroundResolve() {
 	const (
 		FailureRetryInterval = 5 * time.Second
+		MinimumRetryInterval = 100 * time.Millisecond
 	)
 	var nextResolve time.Duration
 
@@ -169,7 +170,7 @@ func (p *ECH) backgroundResolve() {
 
 			roundtrip := time.Since(s)
 			effectiveTTL := max(time.Duration(ttl)*time.Second-roundtrip/2, 0)
-			nextResolve = max(effectiveTTL-3*roundtrip/2, 0)
+			nextResolve = max(effectiveTTL-3*roundtrip/2, MinimumRetryInterval)
 
 			p.l.Info("ech : update ECHConfigList",
 				zap.String("forward_tag", p.fwTag),
