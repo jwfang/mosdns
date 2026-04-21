@@ -274,6 +274,13 @@ func (p *ECH) pollMatchCache(qname string) bool {
 	return false
 }
 
+func emptyResponse(qCtx *query_context.Context) *dns.Msg {
+	r := &dns.Msg{}
+	r.SetReply(qCtx.Q())
+	qCtx.SetResponse(r)
+	return r
+}
+
 func (p *ECH) Exec(_ context.Context, qCtx *query_context.Context) error {
 	q := qCtx.QQuestion()
 	if q.Qtype != dns.TypeHTTPS {
@@ -281,44 +288,53 @@ func (p *ECH) Exec(_ context.Context, qCtx *query_context.Context) error {
 	}
 
 	qname := q.Name
+	r := qCtx.R()
+
 	if p.impl.match != nil && !p.pollMatchCache(qCtx.QQuestion().Name) {
 		p.l.Debug("ech poll match cache NOT match",
 			zap.String("forward_tag", p.impl.tags.forward),
 			zap.String("ech_qname", p.impl.qname),
 			zap.String("qname", qname))
+		if r == nil {
+			emptyResponse(qCtx)
+		}
 		return nil
 	}
 
-	r := qCtx.R()
-
-	// exec(ed) before forward, direct response
 	if r == nil {
-		cr := p.r.Load()
-		if cr == nil {
-			p.l.Warn("ech failed: empty ECHConfigList, configuration or network error",
-				zap.String("forward_tag", p.impl.tags.forward),
-				zap.String("ech_qname", p.impl.qname),
-				zap.String("qname", qname))
-			return fmt.Errorf("ech failed: empty ECHConfigList, configuration or network error")
-		} else {
-			r = &dns.Msg{}
-			r.SetReply(qCtx.Q())
-			ht := *cr.rr
-			ht.Hdr.Name = qname
-			ht.Hdr.Ttl = uint32(max(time.Duration(cr.ttl)*time.Second-time.Since(cr.ts), 0))
-			r.Answer = append(r.Answer, &ht)
+		return p.generateResponse(r, qname, qCtx)
+	} else {
+		return p.filterResponse(r, qname)
+	}
+}
 
-			qCtx.SetResponse(r)
+func (p *ECH) generateResponse(r *dns.Msg, qname string, qCtx *query_context.Context) error {
+	cr := p.r.Load()
+	if cr == nil {
+		p.l.Warn("ech failed: empty ECHConfigList, configuration or network error",
+			zap.String("forward_tag", p.impl.tags.forward),
+			zap.String("ech_qname", p.impl.qname),
+			zap.String("qname", qname))
+		emptyResponse(qCtx)
+		return fmt.Errorf("ech failed: empty ECHConfigList, configuration or network error")
+	} else {
+		r = emptyResponse(qCtx)
+		ht := *cr.rr
+		ht.Hdr.Name = qname
+		ht.Hdr.Ttl = uint32(max(time.Duration(cr.ttl)*time.Second-time.Since(cr.ts), 0))
+		r.Answer = append(r.Answer, &ht)
 
-			p.l.Debug("ech direct response",
-				zap.String("forward_tag", p.impl.tags.forward),
-				zap.String("ech_qname", p.impl.qname),
-				zap.String("qname", qname))
+		p.l.Debug("ech direct response",
+			zap.String("forward_tag", p.impl.tags.forward),
+			zap.String("ech_qname", p.impl.qname),
+			zap.String("qname", qname))
 
-			return nil
-		}
+		return nil
 	}
 
+}
+
+func (p *ECH) filterResponse(r *dns.Msg, qname string) error {
 	if r.Rcode != dns.RcodeSuccess {
 		p.l.Debug("ech upstream failure, skipping",
 			zap.String("forward_tag", p.impl.tags.forward),
