@@ -25,7 +25,6 @@ import (
 	"github.com/IrineSistiana/mosdns/v5/pkg/query_context"
 	"github.com/IrineSistiana/mosdns/v5/plugin/executable/sequence"
 	"github.com/miekg/dns"
-	"slices"
 	"strconv"
 	"strings"
 )
@@ -59,10 +58,25 @@ func NewFilterResp(rrt uint16) *FilterResp {
 }
 
 func (f *FilterResp) Exec(ctx context.Context, qCtx *query_context.Context) error {
-	if r := qCtx.R(); r != nil {
-		r.Answer = slices.DeleteFunc(r.Answer, func(rr dns.RR) bool {
-			return rr.Header().Rrtype == f.rrtype
-		})
+	r := qCtx.R()
+	if r == nil {
+		return nil
 	}
+
+	qname := qCtx.QQuestion().Name
+	var as []dns.RR
+	for _, a := range r.Answer {
+		h := a.Header()
+		if h.Rrtype == f.rrtype {
+			continue
+		}
+
+		if f.rrtype == dns.TypeCNAME {
+			h.Name = qname
+		}
+		as = append(as, a)
+	}
+	r.Answer = as
+
 	return nil
 }
