@@ -308,13 +308,6 @@ func (p *ECH) pollMatchCache(qname string) bool {
 	return false
 }
 
-func emptyResponse(qCtx *query_context.Context) *dns.Msg {
-	r := &dns.Msg{}
-	r.SetReply(qCtx.Q())
-	// qCtx.SetResponse(r)
-	return r
-}
-
 func (p *ECH) Exec(_ context.Context, qCtx *query_context.Context) error {
 	q := qCtx.QQuestion()
 	if q.Qtype != dns.TypeHTTPS {
@@ -335,98 +328,18 @@ func (p *ECH) Exec(_ context.Context, qCtx *query_context.Context) error {
 		return nil
 	}
 
-	if r == nil {
-		return p.generateResponse(qname, qCtx)
-	} else {
-		return p.filterResponse(r, qname)
-	}
-}
-
-func (p *ECH) generateResponse(qname string, qCtx *query_context.Context) error {
 	rr := p.rr.Load()
 	if rr == nil {
 		p.l.Warn("ech failed: empty ECHConfigList, configuration or network error",
 			zap.String("forward_tag", p.impl.tags.forward),
 			zap.String("ech_qname", p.impl.qname),
 			zap.String("qname", qname))
-		emptyResponse(qCtx)
 		return fmt.Errorf("ech failed: empty ECHConfigList, configuration or network error")
+	}
+
+	if r == nil {
+		return p.directResponse(rr, qname, qCtx)
 	} else {
-		r := emptyResponse(qCtx)
-		ht := *rr.rr
-		ht.Hdr.Name = qname
-		if rr.ts == 0 {
-			ht.Hdr.Ttl = 3600
-		} else {
-			ht.Hdr.Ttl = uint32(max(int64(rr.ttl)+rr.ts-time.Now().Unix(), 0))
-		}
-		r.Answer = append(r.Answer, &ht)
-		qCtx.SetResponse(r)
-
-		p.l.Debug("ech direct response",
-			zap.String("forward_tag", p.impl.tags.forward),
-			zap.String("ech_qname", p.impl.qname),
-			zap.String("qname", qname))
-
-		return nil
+		return p.filterResponse(rr, r, qname)
 	}
-
-}
-
-func (p *ECH) filterResponse(r *dns.Msg, qname string) error {
-	if r.Rcode != dns.RcodeSuccess {
-		p.l.Debug("ech upstream failure, skipping",
-			zap.String("forward_tag", p.impl.tags.forward),
-			zap.String("ech_qname", p.impl.qname),
-			zap.String("qname", qname),
-			zap.String("rcode", dns.RcodeToString[r.Rcode]))
-		return nil
-	}
-
-	p.l.Debug("ech filtering response",
-		zap.String("forward_tag", p.impl.tags.forward),
-		zap.String("ech_qname", p.impl.qname),
-		zap.String("qname", qname))
-	var ok bool
-	var ht *dns.HTTPS
-	for _, rr := range r.Answer {
-		if rr.Header().Rrtype == dns.TypeHTTPS {
-			ht = rr.(*dns.HTTPS)
-			break
-		}
-	}
-	if ht == nil {
-		ht = &dns.HTTPS{dns.SVCB{Priority: 1, Target: ".",
-			Hdr: dns.RR_Header{Name: r.Question[0].Name, Rrtype: dns.TypeHTTPS, Class: dns.ClassINET}}}
-		r.Answer = append(r.Answer, ht)
-	}
-
-	var ec *dns.SVCBECHConfig
-	for _, kv := range ht.Value {
-		if ec, ok = kv.(*dns.SVCBECHConfig); ok {
-			p.l.Warn("ech filter response, found ECHConfig",
-				zap.String("forward_tag", p.impl.tags.forward),
-				zap.String("ech_qname", p.impl.qname),
-				zap.String("qname", qname))
-			break
-		}
-	}
-	if ec == nil {
-		p.l.Warn("ech filter response, no ECHConfig, adding",
-			zap.String("forward_tag", p.impl.tags.forward),
-			zap.String("ech_qname", p.impl.qname),
-			zap.String("qname", qname))
-		ech := p.rr.Load().ech
-		if ht == nil {
-			p.l.Warn("ech failed: empty ECHConfigList, configuration or network error",
-				zap.String("forward_tag", p.impl.tags.forward),
-				zap.String("ech_qname", p.impl.qname),
-				zap.String("qname", qname))
-			return fmt.Errorf("ech failed: empty ECHConfigList, configuration or network error")
-		} else {
-			ht.Value = append(ht.Value, ech)
-		}
-	}
-
-	return nil
 }
