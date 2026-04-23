@@ -22,6 +22,7 @@ package ech
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/binary"
 	"fmt"
 	"github.com/IrineSistiana/mosdns/v5/pkg/query_context"
@@ -65,6 +66,14 @@ func validateECH(bs []byte) error {
 	}
 
 	return nil
+}
+
+func validateECHString(s string) error {
+	bs, err := base64.StdEncoding.DecodeString(s)
+	if err != nil {
+		return err
+	}
+	return validateECH(bs)
 }
 
 func resolveECH(fw *fastforward.Forward, qn string) (*dns.HTTPS, *dns.SVCBECHConfig, uint32, error) {

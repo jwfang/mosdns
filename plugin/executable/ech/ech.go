@@ -53,13 +53,11 @@ type Match struct {
 }
 
 type Args struct {
+	ECH        string `yaml:"ech"`
 	ForwardTag string `yaml:"forward"`
 	ECHQName   string `yaml:"qname"`
-	Match      *Match `yaml:"match"`
-}
 
-func (a *Args) validate() error {
-	return nil
+	Match *Match `yaml:"match"`
 }
 
 type match struct {
@@ -76,15 +74,35 @@ type tags struct {
 }
 
 type impl struct {
+	ech     []byte
 	forward *fastforward.Forward
 	qname   string
-	match   *match
-	tags    tags
+
+	match *match
+	tags  tags
 }
 
 func fromArgs(args *Args, cm *coremain.Mosdns, logger *zap.Logger) (*impl, error) {
+	if args.ECH == "" && args.ForwardTag == "" {
+		return nil, fmt.Errorf("ech config: should configure either `ech` or `forward`")
+	}
+
+	var ech []byte
+	if args.ECH != "" {
+		bs, err := base64.StdEncoding.DecodeString(args.ECH)
+		if err != nil {
+			return nil, err
+		}
+		err = validateECH(bs)
+		if err != nil {
+			return nil, err
+		}
+		ech = bs
+	}
+
 	m := args.Match
 	logger.Info(("ech init, configuration"),
+		zap.String("ech", args.ECH),
 		zap.String("forward_tag", args.ForwardTag),
 		zap.String("ech_qname", args.ECHQName))
 
@@ -111,16 +129,16 @@ func fromArgs(args *Args, cm *coremain.Mosdns, logger *zap.Logger) (*impl, error
 
 	var im *impl
 	if m == nil {
-		im = &impl{fw, args.ECHQName, nil, tags{forward: args.ForwardTag}}
+		im = &impl{ech, fw, args.ECHQName, nil, tags{forward: args.ForwardTag}}
 	} else {
-		im = &impl{fw, args.ECHQName, &match{is.GetIPMatcher(), cc, time.Duration(args.Match.PollInterval) * time.Millisecond, time.Duration(args.Match.MaxDelay) * time.Millisecond}, tags{args.ForwardTag, args.Match.IpSetTag, args.Match.CacheTag}}
+		im = &impl{ech, fw, args.ECHQName, &match{is.GetIPMatcher(), cc, time.Duration(args.Match.PollInterval) * time.Millisecond, time.Duration(args.Match.MaxDelay) * time.Millisecond}, tags{args.ForwardTag, args.Match.IpSetTag, args.Match.CacheTag}}
 	}
 	return im, nil
 }
 
 type rrLocal struct {
 	ttl uint32
-	ts  time.Time
+	ts  int64
 
 	rr  *dns.HTTPS
 	ech *dns.SVCBECHConfig
@@ -130,7 +148,7 @@ type ECH struct {
 	*impl
 	l *zap.Logger
 
-	r atomic.Pointer[rrLocal]
+	rr atomic.Pointer[rrLocal]
 }
 
 func getPlugins(cm *coremain.Mosdns, args *Args) (*fastforward.Forward, *ip_set.IPSet, *cache.Cache, error) {
@@ -139,9 +157,11 @@ func getPlugins(cm *coremain.Mosdns, args *Args) (*fastforward.Forward, *ip_set.
 	var cc *cache.Cache
 	var ok bool
 
-	fw, ok = cm.GetPlugin(args.ForwardTag).(*fastforward.Forward)
-	if !ok {
-		return nil, nil, nil, fmt.Errorf("no forward with tag `%s`", args.ForwardTag)
+	if args.ECH == "" {
+		fw, ok = cm.GetPlugin(args.ForwardTag).(*fastforward.Forward)
+		if !ok {
+			return nil, nil, nil, fmt.Errorf("no forward with tag `%s`", args.ForwardTag)
+		}
 	}
 
 	if m := args.Match; m != nil {
@@ -168,12 +188,17 @@ func Init(bp *coremain.BP, args any) (any, error) {
 
 func QuickSetup(bq sequence.BQ, args string) (any, error) {
 	fs := strings.Fields(args)
-	if len(fs) != 2 {
-		return nil, fmt.Errorf("wrong parameters, usage: ech $forward server_name")
+	var ech, fwt, qn string
+	switch len(fs) {
+	case 1:
+		ech = fs[0]
+	case 2:
+		fwt, qn = fs[0], fs[1]
+	default:
+		return nil, fmt.Errorf("wrong parameters, usage: ech [ $forward server_name | base64-string ]")
 	}
-	fwt, qn := fs[0], fs[1]
 
-	impl, err := fromArgs(&Args{fwt, qn, nil}, bq.M(), bq.L())
+	impl, err := fromArgs(&Args{ech, fwt, qn, nil}, bq.M(), bq.L())
 	if err != nil {
 		return nil, err
 	}
@@ -184,9 +209,18 @@ func QuickSetup(bq sequence.BQ, args string) (any, error) {
 func newECH(impl *impl, logger *zap.Logger) *ECH {
 	impl.qname = dns.Fqdn(impl.qname)
 
-	ech := &ECH{impl: impl, l: logger}
-	go ech.backgroundResolve()
-	return ech
+	n := &ECH{impl: impl, l: logger}
+	if impl.ech != nil {
+		ech := dns.SVCBECHConfig{impl.ech}
+		ht := dns.HTTPS{
+			dns.SVCB{dns.RR_Header{".", dns.TypeHTTPS, dns.ClassINET, 0, 0},
+				1, ".", nil}}
+		ht.Value = append(ht.Value, &ech)
+		n.rr.Store(&rrLocal{0, 0, &ht, &ech})
+	} else {
+		go n.backgroundResolve()
+	}
+	return n
 }
 
 func (p *ECH) backgroundResolve() {
@@ -209,7 +243,7 @@ func (p *ECH) backgroundResolve() {
 				continue
 			}
 
-			p.r.Store(&rrLocal{ttl, time.Now(), ht, ech})
+			p.rr.Store(&rrLocal{ttl, time.Now().Unix(), ht, ech})
 
 			roundtrip := time.Since(s)
 			effectiveTTL := max(time.Duration(ttl)*time.Second-roundtrip/2, 0)
@@ -277,7 +311,7 @@ func (p *ECH) pollMatchCache(qname string) bool {
 func emptyResponse(qCtx *query_context.Context) *dns.Msg {
 	r := &dns.Msg{}
 	r.SetReply(qCtx.Q())
-	qCtx.SetResponse(r)
+	// qCtx.SetResponse(r)
 	return r
 }
 
@@ -302,15 +336,15 @@ func (p *ECH) Exec(_ context.Context, qCtx *query_context.Context) error {
 	}
 
 	if r == nil {
-		return p.generateResponse(r, qname, qCtx)
+		return p.generateResponse(qname, qCtx)
 	} else {
 		return p.filterResponse(r, qname)
 	}
 }
 
-func (p *ECH) generateResponse(r *dns.Msg, qname string, qCtx *query_context.Context) error {
-	cr := p.r.Load()
-	if cr == nil {
+func (p *ECH) generateResponse(qname string, qCtx *query_context.Context) error {
+	rr := p.rr.Load()
+	if rr == nil {
 		p.l.Warn("ech failed: empty ECHConfigList, configuration or network error",
 			zap.String("forward_tag", p.impl.tags.forward),
 			zap.String("ech_qname", p.impl.qname),
@@ -318,11 +352,16 @@ func (p *ECH) generateResponse(r *dns.Msg, qname string, qCtx *query_context.Con
 		emptyResponse(qCtx)
 		return fmt.Errorf("ech failed: empty ECHConfigList, configuration or network error")
 	} else {
-		r = emptyResponse(qCtx)
-		ht := *cr.rr
+		r := emptyResponse(qCtx)
+		ht := *rr.rr
 		ht.Hdr.Name = qname
-		ht.Hdr.Ttl = uint32(max(time.Duration(cr.ttl)*time.Second-time.Since(cr.ts), 0))
+		if rr.ts == 0 {
+			ht.Hdr.Ttl = 3600
+		} else {
+			ht.Hdr.Ttl = uint32(max(int64(rr.ttl)+rr.ts-time.Now().Unix(), 0))
+		}
 		r.Answer = append(r.Answer, &ht)
+		qCtx.SetResponse(r)
 
 		p.l.Debug("ech direct response",
 			zap.String("forward_tag", p.impl.tags.forward),
@@ -377,7 +416,7 @@ func (p *ECH) filterResponse(r *dns.Msg, qname string) error {
 			zap.String("forward_tag", p.impl.tags.forward),
 			zap.String("ech_qname", p.impl.qname),
 			zap.String("qname", qname))
-		ech := p.r.Load().ech
+		ech := p.rr.Load().ech
 		if ht == nil {
 			p.l.Warn("ech failed: empty ECHConfigList, configuration or network error",
 				zap.String("forward_tag", p.impl.tags.forward),
