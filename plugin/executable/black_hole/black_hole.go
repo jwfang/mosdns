@@ -29,10 +29,14 @@ import (
 	"strings"
 )
 
-const PluginType = "black_hole"
+const (
+	PluginType  = "black_hole"
+	PluginTypeR = "resp_ip"
+)
 
 func init() {
 	sequence.MustRegExecQuickSetup(PluginType, QuickSetup)
+	sequence.MustRegExecQuickSetup(PluginTypeR, QuickSetup)
 }
 
 var _ sequence.Executable = (*BlackHole)(nil)
